@@ -357,42 +357,41 @@ class UserSegmentCompare:
     compare_metric: MetricDef
     data_a: list[float] = field(default_factory=list)
     data_b: list[float] = field(default_factory=list)
+    # 可选：带独立身份的观测；不传时按原值列表生成确定性基础身份。
+    observations_a: list[Any] | None = field(default=None, repr=False, compare=False)
+    observations_b: list[Any] | None = field(default=None, repr=False, compare=False)
+    group_a_name: str = field(default="a", repr=False, compare=False)
+    group_b_name: str = field(default="b", repr=False, compare=False)
+
+    def read_evidence(self):
+        """读取两组样本的统计证据（分群比较与实验分析共用同一份读取逻辑）。"""
+        from app.sample_evidence import read_sample_evidence
+
+        return read_sample_evidence(
+            self.data_a,
+            self.data_b,
+            observations_a=self.observations_a,
+            observations_b=self.observations_b,
+            group_a_name=self.group_a_name,
+            group_b_name=self.group_b_name,
+        )
+
+    @property
+    def sample_evidence(self):
+        """当前样本的统计证据（只读属性）；需要显式调用时用 read_evidence()。"""
+        return self.read_evidence()
+
+    @property
+    def evidence(self):
+        return self.read_evidence()
+
+    collect_evidence = read_evidence
 
     def compute_ttest(self) -> dict[str, Any]:
         """Welch's t-test 计算两组均值的统计显著性。"""
-        import math
-        n_a, n_b = len(self.data_a), len(self.data_b)
-        if n_a < 2 or n_b < 2:
-            return {"t_stat": 0.0, "p_value": 1.0, "significant": False, "reason": "样本不足"}
+        from app.sample_evidence import welch_ttest
 
-        mean_a = sum(self.data_a) / n_a
-        mean_b = sum(self.data_b) / n_b
-
-        var_a = sum((x - mean_a) ** 2 for x in self.data_a) / (n_a - 1)
-        var_b = sum((x - mean_b) ** 2 for x in self.data_b) / (n_b - 1)
-
-        se = math.sqrt(var_a / n_a + var_b / n_b)
-        if se == 0:
-            return {"t_stat": 0.0, "p_value": 1.0, "significant": False}
-
-        t_stat = (mean_a - mean_b) / se
-
-        # Welch-Satterthwaite 自由度
-        df_num = (var_a / n_a + var_b / n_b) ** 2
-        df_den = ((var_a / n_a) ** 2) / (n_a - 1) + ((var_b / n_b) ** 2) / (n_b - 1)
-        df = df_num / df_den
-
-        p_value = _t_distribution_pvalue(abs(t_stat), df)
-
-        return {
-            "t_stat": round(t_stat, 4),
-            "p_value": round(p_value, 4),
-            "significant": p_value < 0.05,
-            "mean_a": round(mean_a, 4),
-            "mean_b": round(mean_b, 4),
-            "n_a": n_a,
-            "n_b": n_b,
-        }
+        return welch_ttest(self.read_evidence())
 
 
 # ============================================================
@@ -444,27 +443,64 @@ class ExperimentResult:
     lift: float = 0.0
     p_value: float = 1.0
     significant: bool = False
+    # 可选：带独立身份的观测；不传时按原值列表生成确定性基础身份。
+    observations_control: list[Any] | None = field(default=None, repr=False, compare=False)
+    observations_treatment: list[Any] | None = field(default=None, repr=False, compare=False)
+    # 组装结论时实际采用的样本证据（分析后填充）。
+    sample_evidence: Any = field(default=None, repr=False, compare=False)
+
+    def read_evidence(self):
+        """读取两组样本的统计证据（与分群比较共用同一份读取逻辑）。"""
+        from app.sample_evidence import read_sample_evidence
+
+        return read_sample_evidence(
+            self.control_data,
+            self.treatment_data,
+            observations_a=self.observations_control,
+            observations_b=self.observations_treatment,
+            group_a_name="control",
+            group_b_name="treatment",
+        )
+
+    # 语义别名：样本统计证据
+    collect_evidence = read_evidence
+    evidence = read_evidence
 
     def analyze(self) -> ExperimentResult:
-        """执行 t-test 并计算提升幅度。"""
-        compare = UserSegmentCompare(
-            compare_id=self.report_id,
-            segment_a=Segment(segment_id="control", segment_name="对照组"),
-            segment_b=Segment(segment_id="treatment", segment_name="实验组"),
-            compare_metric=self.metric,
-            data_a=self.control_data,
-            data_b=self.treatment_data,
+        """执行 t-test 并计算提升幅度。
+
+        显著性和两组均值都从同一份样本证据读取，不会出现跨批次拼接。
+        """
+        from app.sample_evidence import analyze_evidence
+
+        evidence = self.read_evidence()
+        analysis = analyze_evidence(
+            evidence,
+            report_id=self.report_id,
+            sample_source="experiment_result",
         )
-        result = compare.compute_ttest()
-        self.p_value = result["p_value"]
-        self.significant = result["significant"]
-        if self.control_data:
-            self.control_mean = sum(self.control_data) / len(self.control_data)
-        if self.treatment_data:
-            self.treatment_mean = sum(self.treatment_data) / len(self.treatment_data)
-        if self.control_mean > 0:
-            self.lift = round((self.treatment_mean - self.control_mean) / self.control_mean, 4)
+        self.sample_evidence = evidence
+        self.p_value = analysis.p_value
+        self.significant = analysis.significant
+        self.control_mean = analysis.control_mean
+        self.treatment_mean = analysis.treatment_mean
+        self.lift = analysis.lift
         return self
+
+    def begin_analysis(self, **kwargs):
+        """开始一次可补报、只发布一次的分析会话。"""
+        from app.sample_evidence import ExperimentAnalysis
+
+        return ExperimentAnalysis(
+            self.report_id,
+            control_data=self.control_data,
+            treatment_data=self.treatment_data,
+            observations_control=self.observations_control,
+            observations_treatment=self.observations_treatment,
+            experiment=self.experiment,
+            metric=self.metric,
+            **kwargs,
+        )
 
 
 # ============================================================

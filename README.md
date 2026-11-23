@@ -81,5 +81,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 样本统计证据
+
+分群比较（`UserSegmentCompare`）与实验分析（`ExperimentResult`）读取样本时
+共用 `app/sample_evidence.py` 里的同一份读取逻辑，产出 `SampleEvidence`
+（样本数、均值、方差、每观测独立身份、批次号）：
+
+- `compare.compute_ttest()` 仍返回 `t_stat / p_value / significant / mean_a /
+  mean_b / n_a / n_b`，实验分析仍返回对照组均值、实验组均值与 `lift`，
+  输入输出不变，只是改为从同一份证据计算。
+- 空样本走样本不足、零方差走不显著，均保留原有行为；方差仍为 `n - 1` 口径。
+- 证据登记每个观测的 `observation_id`：重复送达只计一次；同号异值待核、
+  不入样；异号同额各自入样。
+- 实验分析用 `ExperimentAnalysis` 冻结证据，`settle("original")` 按检验时的
+  完整输入结清，`settle("latest")` 换入已确认补报后重新检验；同一分析
+  并发发布只产生一次结果，显著性与提升始终来自同一批次，历史结果可
+  `recompute()` 复算。
+
 领域：数据工程
 子方向：数据分析与数据应用
